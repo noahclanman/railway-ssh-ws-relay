@@ -1,0 +1,15 @@
+{
+  "name": "railway-ssh-ws-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fixed-target SSH over WebSocket relay for Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
