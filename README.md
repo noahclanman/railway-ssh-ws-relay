@@ -1,110 +1,126 @@
-# Railway SSH-over-WebSocket Relay
+# Railway SSH-over-WebSocket Relay v2.0
 
-A fixed-target WebSocket-to-TCP relay intended to carry an SSH byte stream from an authorized client to your own VPS SSH/Dropbear listener.
+This project relays an authorized HTTP Injector SSH tunnel from Railway to a fixed SSH or Dropbear service on your own VPS.
 
-It exposes two upgrade paths:
-
-- `/ssh` — real RFC 6455 WebSocket framing. Use this first.
-- `/raw` — compatibility mode for clients that expect `101 Switching Protocols` and then send raw, unframed SSH bytes. This mode is experimental because platform edge proxies may require standards-compliant WebSocket frames.
-
-The backend target is fixed by Railway environment variables. Clients cannot choose arbitrary destinations, so this is not an open proxy.
-
-## Architecture
+## Correct connection path
 
 ```text
-HTTP Injector
-    -> WSS :443
-Railway public domain /ssh
-    -> outbound TCP
-Your VPS Dropbear/sshd port, for example :550
+HTTP Injector -- TLS/WSS port 443 --> Railway relay -- raw TCP --> VPS_IP:550 Dropbear
 ```
 
-You do not need PDirect.py on the VPS when `/ssh` or `/raw` connects directly to Dropbear. Keep the selected Dropbear/SSH port reachable from Railway.
+`TARGET_PORT=550` is correct when Dropbear listens on VPS port 550. Do not point the relay to VPS port 80 when port 80 is PDirect/WebSocket; the Railway service already performs the HTTP upgrade.
 
-## Railway deployment
-
-1. Upload this folder to a GitHub repository.
-2. In Railway, create a project and choose **Deploy from GitHub Repo**.
-3. Add these service variables:
+## Railway variables
 
 ```env
-TARGET_HOST=your-vps-ip-or-dns
+TARGET_HOST=YOUR_VPS_PUBLIC_IP
 TARGET_PORT=550
-RELAY_TOKEN=generate-a-long-random-secret
+RELAY_TOKEN=YOUR_LONG_RANDOM_SECRET
+CONNECT_TIMEOUT_MS=10000
+IDLE_TIMEOUT_MS=0
+MAX_CONNECTIONS_PER_IP=5
 ```
 
-4. In **Settings -> Networking -> Public Networking**, generate a Railway domain or add a custom domain.
-5. Open `https://YOUR_DOMAIN/health`. It should return `"ok": true`.
+Your VPS firewall/security group must allow inbound TCP 550. Test from another machine:
 
-The process must bind to Railway's `PORT`; this project already does that.
-
-## HTTP Injector setup
-
-Use the same SSH username and password that exist on the VPS. The public connection endpoint is the Railway domain on port `443`.
-
-### Mode A: real WebSocket — recommended
-
-Use this when HTTP Injector has a real SSH-over-WebSocket/WebSocket transport option.
-
-- Server/address: `YOUR_RAILWAY_DOMAIN`
-- Port: `443`
-- TLS/SSL: enabled
-- SNI: `YOUR_RAILWAY_DOMAIN`
-- WebSocket path: `/ssh?token=YOUR_RELAY_TOKEN`
-- Host header: `YOUR_RAILWAY_DOMAIN`
-
-A standards-compliant handshake looks like:
-
-```http
-GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1
-Host: YOUR_RAILWAY_DOMAIN
-Upgrade: websocket
-Connection: Upgrade
-Sec-WebSocket-Version: 13
-Sec-WebSocket-Key: <client-generated-random-key>
+```bash
+nc -vz YOUR_VPS_PUBLIC_IP 550
 ```
 
-Let HTTP Injector generate the WebSocket key when possible.
+A reachable SSH port should also show an SSH banner:
 
-### Mode B: raw 101 compatibility
+```bash
+timeout 5 bash -c 'cat < /dev/null > /dev/tcp/YOUR_VPS_PUBLIC_IP/550'
+```
 
-Use this only when your existing VPS setup works by receiving a `101` response and then sending raw SSH bytes without WebSocket frames.
+## Deploy
 
-Example payload:
+1. Upload this folder to GitHub.
+2. Create a Railway project from the repository.
+3. Add the variables above.
+4. Generate a Railway public domain.
+5. Open `https://YOUR_RAILWAY_DOMAIN/health`.
+
+Expected health result includes:
+
+```json
+{"ok":true,"version":"2.0.0","target":"YOUR_VPS_PUBLIC_IP:550"}
+```
+
+Then verify that Railway can actually reach Dropbear:
 
 ```text
-GET /raw?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
+https://YOUR_RAILWAY_DOMAIN/check-target?token=YOUR_RELAY_TOKEN
+```
+
+A correct response should contain `"reachable":true`, an `SSH-2.0-...` banner, and `"looksLikeSsh":true`. A `502` here means the VPS IP, port, firewall, or Dropbear listener is wrong.
+
+## HTTP Injector configuration
+
+Use Railway on public port 443:
+
+```text
+SSH host/server: YOUR_RAILWAY_DOMAIN
+SSH port: 443
+SSL/TLS: ON
+SNI: YOUR_RAILWAY_DOMAIN
+SSH username/password: your VPS SSH account
+```
+
+Use this custom payload:
+
+```text
+GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
 Host: YOUR_RAILWAY_DOMAIN[crlf]
 Upgrade: websocket[crlf]
-Connection: Upgrade[crlf][crlf]
+Connection: Upgrade[crlf]
+Sec-WebSocket-Version: 13[crlf]
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf][crlf]
 ```
 
-If Railway rejects the connection or SSH identification never appears, your client/platform combination requires real WebSocket framing; use `/ssh` instead.
+The `/ssh` route intentionally behaves like PDirect: it returns `101 Switching Protocols` and then passes raw SSH bytes to Dropbear.
 
-## VPS firewall
+Expected response:
 
-Allow the backend SSH/Dropbear port only from trusted sources where practical. Railway outbound IPs may not be static on every plan/setup, so confirm your Railway networking options before using an IP allowlist. At minimum:
+```http
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+X-Relay-Mode: raw-ssh
+```
 
-- use a strong SSH password or, preferably, an SSH key;
-- set a long `RELAY_TOKEN`;
-- do not expose an unrestricted target selector;
-- keep `MAX_CONNECTIONS_PER_IP` low.
+For a true RFC 6455 WebSocket client, use `/ws?token=...` instead. HTTP Injector custom-payload mode should use `/ssh`.
 
-## Important Railway limitation
+## Important port behavior
 
-Railway's HTTP public edge currently applies a maximum request duration to WebSocket connections. A long-running VPN tunnel may therefore be disconnected periodically. HTTP Injector must reconnect, and the SSH session will be re-established. This makes Railway workable for testing or reconnect-capable use, but less stable than a relay on a VPS/CDN path without that hard connection-duration limit.
+- Public `443`: use this with Railway and enable SSL/TLS in HTTP Injector.
+- Public `80`: Railway's edge may redirect HTTP to HTTPS, resulting in `301` before this app receives the request.
+- Backend `550`: Railway connects here on your VPS because this is Dropbear/SSH.
+- VPS `80`: not used by this relay if it runs PDirect/WebSocket.
 
-## Local run
+The Node app itself never sends a `301` redirect.
+
+## Status codes
+
+- `101`: upgrade succeeded.
+- `301`/`308`: Railway or another edge redirected HTTP to HTTPS; use port 443 with SSL enabled.
+- `401`: missing or incorrect `RELAY_TOKEN`.
+- `404`: wrong path; use `/ssh`.
+- `429`: too many simultaneous connections from one IP.
+- `502`: Railway cannot reach `TARGET_HOST:TARGET_PORT`.
+- `503`: `TARGET_HOST` is missing.
+
+## Local tests
 
 ```bash
-export TARGET_HOST=127.0.0.1
-export TARGET_PORT=22
-export RELAY_TOKEN=test-secret
-node server.js
+npm run check
+npm test
 ```
 
-Health check:
+The tests create a mock Dropbear-style backend and verify:
 
-```bash
-curl http://127.0.0.1:3000/health
-```
+- `/ssh` returns 101 and relays the SSH banner plus raw bidirectional bytes.
+- `/ws` performs RFC 6455 framing and relays SSH bytes.
+- Invalid token returns 401.
+- Invalid path returns 404.
+- Unreachable backend returns 502.
