@@ -360,21 +360,3 @@ The request was redirected before the application processed the upgrade. Use HTT
 ### Connection opens but authentication fails
 
 The gateway only forwards TCP traffic. Authentication is still handled by the backend service, so use a valid backend username, password, or key.
-
-## Security recommendations
-
-- Keep the GitHub repository private.
-- Never commit a real `.env` file.
-- Use a random token of at least 32 bytes.
-- Rotate the token if it is exposed.
-- Restrict the backend firewall when practical.
-- Do not expose diagnostic routes containing backend addresses or banners.
-- Prefer TLS on port `443` for client connections.
-- Do not publish screenshots containing environment variables.
-- Review Railway logs without sharing tokens or backend addresses.
-
-The gateway hides configuration details from normal HTTP responses, but it does not make a public repository private or prevent network operators from observing unencrypted port-80 traffic.
-
-## License
-
-MIT
