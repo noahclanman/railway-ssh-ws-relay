@@ -26,8 +26,8 @@ const CONFIG = Object.freeze({
   pingIntervalMs: envInt('PING_INTERVAL_MS', 25000, 5000, 3600000),
 });
 
-const RAW_PATHS = new Set(['/', '/ssh', '/ssh-ws', '/raw']);
-const FRAMED_PATHS = new Set(['/ws', '/rfc6455']);
+const RAW_PATHS = new Set(['/ssh']);
+const FRAMED_PATHS = new Set(['/ws']);
 const activeByIp = new Map();
 
 function log(event, details = {}) {
@@ -127,11 +127,8 @@ function writeRawUpgrade(req, socket) {
   let response =
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
-    'Connection: Upgrade\r\n' +
-    'X-Relay-Mode: raw-ssh\r\n';
+    'Connection: Upgrade\r\n';
 
-  // Returning Sec-WebSocket-Accept helps proxies that expect a conventional
-  // handshake. The stream after 101 intentionally remains raw for HTTP Injector.
   if (validWebSocketKey(key)) {
     response += `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n`;
   }
@@ -146,9 +143,7 @@ function bridgeRaw(req, client, head, upstream, ip, path) {
     if (!client.destroyed) client.destroy();
     if (!upstream.destroyed) upstream.destroy();
     releaseConnection(ip);
-    log('raw_closed', {
-      ip,
-      path,
+    log('connection_closed', {
       reason,
       error: error ? String(error.code || error.message || error) : undefined,
     });
@@ -174,12 +169,7 @@ function bridgeRaw(req, client, head, upstream, ip, path) {
   upstream.on('end', () => close('target_end'));
   client.on('close', () => close('client_close'));
   upstream.on('close', () => close('target_close'));
-
-  log('raw_connected', {
-    ip,
-    path,
-    target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-  });
+  log('connection_opened');
 }
 
 function sendFrame(socket, opcode, payload = Buffer.alloc(0)) {
@@ -281,7 +271,7 @@ function bridgeFramed(req, client, head, upstream, ip, path) {
   if (!validWebSocketKey(key) || version !== '13') {
     upstream.destroy();
     releaseConnection(ip);
-    httpResponse(client, 400, 'Valid RFC 6455 Sec-WebSocket-Key and version 13 are required');
+    httpResponse(client, 400, 'Bad Request');
     return;
   }
 
@@ -294,9 +284,7 @@ function bridgeFramed(req, client, head, upstream, ip, path) {
     if (!client.destroyed) client.destroy();
     if (!upstream.destroyed) upstream.destroy();
     releaseConnection(ip);
-    log('ws_closed', {
-      ip,
-      path,
+    log('connection_closed', {
       reason,
       error: error ? String(error.code || error.message || error) : undefined,
     });
@@ -306,8 +294,7 @@ function bridgeFramed(req, client, head, upstream, ip, path) {
     'HTTP/1.1 101 Switching Protocols\r\n' +
     'Upgrade: websocket\r\n' +
     'Connection: Upgrade\r\n' +
-    `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n` +
-    'X-Relay-Mode: rfc6455\r\n\r\n'
+    `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n\r\n`
   );
 
   client.setNoDelay(true);
@@ -357,110 +344,41 @@ function bridgeFramed(req, client, head, upstream, ip, path) {
   pingTimer.unref();
 
   if (head && head.length > 0) parser.push(head);
-
-  log('ws_connected', {
-    ip,
-    path,
-    target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-  });
+  log('connection_opened');
 }
 
-const server = http.createServer(async (req, res) => {
-  const requestUrl = new URL(req.url || '/', 'http://relay.local');
+const server = http.createServer((req, res) => {
+  let requestUrl;
+  try {
+    requestUrl = new URL(req.url || '/', 'http://localhost');
+  } catch {
+    res.writeHead(400, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'content-length': '0',
+    });
+    res.end();
+    return;
+  }
 
   if (requestUrl.pathname === '/health') {
     const configured = Boolean(CONFIG.targetHost);
+    const body = JSON.stringify({ ok: configured });
     res.writeHead(configured ? 200 : 503, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
+      'content-length': String(Buffer.byteLength(body)),
     });
-    res.end(JSON.stringify({
-      ok: configured,
-      service: 'railway-ssh-ws-relay',
-      version: '2.0.0',
-      target: configured ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
-      rawHttpInjectorPaths: [...RAW_PATHS],
-      framedWebSocketPaths: [...FRAMED_PATHS],
-      activeConnections: [...activeByIp.values()].reduce((sum, count) => sum + count, 0),
-    }));
+    res.end(body);
     return;
   }
 
-  if (requestUrl.pathname === '/check-target') {
-    if (!isAuthorized(req, requestUrl)) {
-      res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, error: 'Invalid relay token' }));
-      return;
-    }
-    if (!CONFIG.targetHost) {
-      res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, error: 'TARGET_HOST is not configured' }));
-      return;
-    }
-
-    let target;
-    try {
-      target = await connectTarget();
-      const started = Date.now();
-      const banner = await new Promise((resolve) => {
-        let settled = false;
-        const finish = (value) => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        const timer = setTimeout(() => finish(''), 3000);
-        target.once('data', (chunk) => {
-          clearTimeout(timer);
-          finish(chunk.subarray(0, 512).toString('utf8').replace(/[\r\n]+$/g, ''));
-        });
-        target.once('error', () => {
-          clearTimeout(timer);
-          finish('');
-        });
-        target.once('close', () => {
-          clearTimeout(timer);
-          finish('');
-        });
-      });
-      target.destroy();
-      res.writeHead(200, {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
-      });
-      res.end(JSON.stringify({
-        ok: true,
-        reachable: true,
-        target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-        connectAndBannerMs: Date.now() - started,
-        banner: banner || null,
-        looksLikeSsh: banner.startsWith('SSH-'),
-      }));
-    } catch (error) {
-      if (target && !target.destroyed) target.destroy();
-      res.writeHead(502, {
-        'content-type': 'application/json; charset=utf-8',
-        'cache-control': 'no-store',
-      });
-      res.end(JSON.stringify({
-        ok: false,
-        reachable: false,
-        target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-        error: String(error.code || error.message || error),
-      }));
-    }
-    return;
-  }
-
-  res.writeHead(200, {
+  res.writeHead(404, {
     'content-type': 'text/plain; charset=utf-8',
     'cache-control': 'no-store',
+    'content-length': '0',
   });
-  res.end(
-    'Railway SSH-over-WebSocket relay v2.0\n' +
-    'HTTP Injector raw tunnel: /ssh\n' +
-    'RFC 6455 framed tunnel: /ws\n'
-  );
+  res.end();
 });
 
 server.on('upgrade', async (req, socket, head) => {
@@ -470,33 +388,27 @@ server.on('upgrade', async (req, socket, head) => {
   try {
     requestUrl = new URL(req.url || '/', 'http://relay.local');
   } catch {
-    httpResponse(socket, 400, 'Invalid request URL');
+    httpResponse(socket, 400, 'Bad Request');
     return;
   }
 
   const path = requestUrl.pathname;
-  log('upgrade_received', {
-    ip,
-    path,
-    host: req.headers.host || '',
-    forwardedProto: req.headers['x-forwarded-proto'] || '',
-    hasWebSocketKey: validWebSocketKey(req.headers['sec-websocket-key']),
-  });
+  log('upgrade_received');
 
   if (!CONFIG.targetHost) {
-    httpResponse(socket, 503, 'TARGET_HOST is not configured');
+    httpResponse(socket, 503, 'Service Unavailable');
     return;
   }
   if (!RAW_PATHS.has(path) && !FRAMED_PATHS.has(path)) {
-    httpResponse(socket, 404, 'Unknown relay path; use /ssh for HTTP Injector');
+    httpResponse(socket, 404, 'Not Found');
     return;
   }
   if (!isAuthorized(req, requestUrl)) {
-    httpResponse(socket, 401, 'Invalid relay token');
+    httpResponse(socket, 401, 'Unauthorized');
     return;
   }
   if (!reserveConnection(ip)) {
-    httpResponse(socket, 429, 'Too many active connections');
+    httpResponse(socket, 429, 'Too Many Requests');
     return;
   }
 
@@ -505,13 +417,10 @@ server.on('upgrade', async (req, socket, head) => {
     upstream = await connectTarget();
   } catch (error) {
     releaseConnection(ip);
-    log('target_connect_error', {
-      ip,
-      path,
-      target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+    log('upstream_error', {
       error: String(error.code || error.message || error),
     });
-    httpResponse(socket, 502, `Cannot connect to SSH backend ${CONFIG.targetHost}:${CONFIG.targetPort}`);
+    httpResponse(socket, 502, 'Bad Gateway');
     return;
   }
 
@@ -537,13 +446,7 @@ server.on('error', (error) => {
 });
 
 server.listen(CONFIG.listenPort, '0.0.0.0', () => {
-  log('listening', {
-    port: CONFIG.listenPort,
-    target: CONFIG.targetHost ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
-    tokenRequired: Boolean(CONFIG.relayToken),
-    rawPaths: [...RAW_PATHS],
-    framedPaths: [...FRAMED_PATHS],
-  });
+  log('listening', { port: CONFIG.listenPort });
 });
 
 function shutdown(signal) {

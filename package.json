@@ -1,8 +1,8 @@
 {
-  "name": "railway-ssh-ws-relay",
-  "version": "2.0.0",
+  "name": "private-gateway",
+  "version": "1.0.0",
   "private": true,
-  "description": "Railway HTTP Injector SSH-over-WebSocket relay to a fixed Dropbear/SSH backend",
+  "description": "Private network gateway",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

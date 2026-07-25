@@ -110,7 +110,7 @@ async function testRawHttpInjector(port) {
         if (end < 0) return;
         const headers = buffer.subarray(0, end).toString('utf8');
         if (!headers.startsWith('HTTP/1.1 101')) throw new Error(`raw expected 101, got ${headers}`);
-        if (!headers.includes('X-Relay-Mode: raw-ssh')) throw new Error('raw mode header missing');
+        if (headers.includes('X-Relay-Mode')) throw new Error('identifying relay header leaked');
         setBuffer(buffer.subarray(end + 4));
         phase = 'banner';
       }
@@ -145,7 +145,7 @@ async function testFramedWebSocket(port) {
         if (end < 0) return;
         const headers = buffer.subarray(0, end).toString('utf8');
         if (!headers.startsWith('HTTP/1.1 101')) throw new Error(`framed expected 101, got ${headers}`);
-        if (!headers.includes('X-Relay-Mode: rfc6455')) throw new Error('framed mode header missing');
+        if (headers.includes('X-Relay-Mode')) throw new Error('identifying relay header leaked');
         frames = buffer.subarray(end + 4);
         setBuffer(Buffer.alloc(0));
         phase = 'banner';
@@ -181,6 +181,27 @@ async function testStatus(port, request, expectedStatus) {
     }
     done();
   });
+}
+
+async function testHttpResponse(port, path, expectedStatus, expectedBody) {
+  await connectAndCollect(
+    port,
+    `GET ${path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n`,
+    ({ buffer, done }) => {
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const headerText = buffer.subarray(0, end).toString('utf8');
+      const firstLine = headerText.split('\r\n')[0];
+      if (!firstLine.startsWith(`HTTP/1.1 ${expectedStatus}`)) {
+        throw new Error(`expected status ${expectedStatus}, got ${firstLine}`);
+      }
+      const body = buffer.subarray(end + 4).toString('utf8');
+      const lengthMatch = headerText.match(/content-length:\s*(\d+)/i);
+      if (lengthMatch && body.length < Number(lengthMatch[1])) return;
+      if (body !== expectedBody) throw new Error(`unexpected body for ${path}: ${JSON.stringify(body)}`);
+      done();
+    }
+  );
 }
 
 async function startRelay(relayPort, targetPort) {
@@ -227,6 +248,13 @@ async function startRelay(relayPort, targetPort) {
   const relay = await startRelay(relayPort, targetPort);
 
   try {
+    await testHttpResponse(relayPort, '/health', 200, '{"ok":true}');
+    console.log('PASS health response is minimal');
+
+    await testHttpResponse(relayPort, '/', 404, '');
+    await testHttpResponse(relayPort, '/check-target?token=test-secret', 404, '');
+    console.log('PASS public HTTP surface reveals no service details');
+
     await testRawHttpInjector(relayPort);
     console.log('PASS raw /ssh: 101, SSH banner, and bidirectional raw bytes');
 
