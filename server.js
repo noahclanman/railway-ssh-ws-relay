@@ -96,7 +96,7 @@ function headerHasToken(value, token) {
   return value.split(',').some((part) => part.trim().toLowerCase() === token);
 }
 
-function validateUpgradeRequest(req) {
+function validateUpgradeRequest(req, requireRfc6455) {
   if (req.method !== 'GET') return 'WebSocket upgrade must use GET';
   if (String(req.headers.upgrade || '').toLowerCase() !== 'websocket') {
     return 'Upgrade: websocket is required';
@@ -104,11 +104,17 @@ function validateUpgradeRequest(req) {
   if (!headerHasToken(req.headers.connection, 'upgrade')) {
     return 'Connection: Upgrade is required';
   }
-  if (req.headers['sec-websocket-version'] !== '13') {
-    return 'Sec-WebSocket-Version: 13 is required';
-  }
-  if (!validWebSocketKey(req.headers['sec-websocket-key'])) {
-    return 'A valid 16-byte Sec-WebSocket-Key is required';
+
+  // HTTP Injector's legacy SSH-over-WS mode commonly sends only the four
+  // basic upgrade headers. Accept that minimal handshake on raw paths.
+  // Strict RFC 6455 headers remain mandatory on framed /ws paths.
+  if (requireRfc6455) {
+    if (req.headers['sec-websocket-version'] !== '13') {
+      return 'Sec-WebSocket-Version: 13 is required';
+    }
+    if (!validWebSocketKey(req.headers['sec-websocket-key'])) {
+      return 'A valid 16-byte Sec-WebSocket-Key is required';
+    }
   }
   return null;
 }
@@ -399,13 +405,13 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: configured,
       service: 'railway-ssh-ws-relay',
-      version: '3.1.0',
+      version: '3.2.0',
       target: configured ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
       rawHttpInjectorPaths: [...RAW_PATHS],
       framedWebSocketPaths: [...FRAMED_PATHS],
       activeConnections: [...activeByIp.values()].reduce((sum, count) => sum + count, 0),
       railwayExternalPorts: { http: 80, https: 443 },
-      note: 'Both external ports map to the same Railway PORT; port 80 requires a complete WebSocket upgrade request',
+      note: 'Raw /ssh accepts HTTP Injector minimal Upgrade headers; /ws requires RFC 6455 headers',
     }));
     return;
   }
@@ -417,7 +423,7 @@ const server = http.createServer(async (req, res) => {
       'upgrade': 'websocket',
       'connection': 'close',
     });
-    res.end('A complete WebSocket upgrade is required. Use Upgrade: websocket, Connection: Upgrade, Sec-WebSocket-Version: 13, and a valid Sec-WebSocket-Key.\n');
+    res.end('An HTTP Upgrade request is required. Raw /ssh needs Upgrade: websocket and Connection: Upgrade; /ws also needs RFC 6455 key/version headers.\n');
     return;
   }
 
@@ -492,7 +498,7 @@ const server = http.createServer(async (req, res) => {
     'cache-control': 'no-store',
   });
   res.end(
-    'Railway SSH-over-WebSocket relay v3.1\n' +
+    'Railway SSH-over-WebSocket relay v3.2\n' +
     'HTTP Injector raw tunnel: /ssh\n' +
     'HTTP Injector raw tunnel: /ssh (valid WebSocket upgrade required)\n' +
     'RFC 6455 framed tunnel: /ws\n'
@@ -511,7 +517,7 @@ server.on('upgrade', async (req, socket, head) => {
   }
 
   const path = requestUrl.pathname;
-  const upgradeError = validateUpgradeRequest(req);
+  const upgradeError = validateUpgradeRequest(req, FRAMED_PATHS.has(path));
   if (upgradeError) {
     log('upgrade_rejected', {
       ip,

@@ -94,6 +94,37 @@ function connectAndCollect(port, request, assertion) {
   });
 }
 
+async function testMinimalRawHttpInjector(port) {
+  let phase = 'headers';
+  await connectAndCollect(
+    port,
+    'GET /ssh?token=test-secret HTTP/1.1\r\n' +
+      'Host: railway.test\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n\r\n',
+    ({ socket, buffer, setBuffer, done }) => {
+      if (phase === 'headers') {
+        const end = buffer.indexOf('\r\n\r\n');
+        if (end < 0) return;
+        const headers = buffer.subarray(0, end).toString('utf8');
+        if (!headers.startsWith('HTTP/1.1 101')) throw new Error(`minimal raw expected 101, got ${headers}`);
+        if (!headers.includes('X-Relay-Mode: raw-ssh')) throw new Error('minimal raw mode header missing');
+        if (headers.toLowerCase().includes('sec-websocket-accept:')) throw new Error('minimal raw should not invent Sec-WebSocket-Accept');
+        setBuffer(buffer.subarray(end + 4));
+        phase = 'banner';
+      }
+      if (phase === 'banner') {
+        if (!buffer.includes(Buffer.from('SSH-2.0-Dropbear_Test'))) return;
+        phase = 'echo';
+        setBuffer(Buffer.alloc(0));
+        socket.write('SSH-2.0-HTTPInjector_Minimal\r\n');
+        return;
+      }
+      if (phase === 'echo' && buffer.includes(Buffer.from('SSH-2.0-HTTPInjector_Minimal'))) done();
+    }
+  );
+}
+
 async function testRawHttpInjector(port, forwardedProto = 'http') {
   let phase = 'headers';
   await connectAndCollect(
@@ -228,6 +259,9 @@ async function startRelay(relayPort, targetPort) {
   const relay = await startRelay(relayPort, targetPort);
 
   try {
+    await testMinimalRawHttpInjector(relayPort);
+    console.log('PASS exact minimal HTTP Injector payload: 101, SSH banner, bidirectional raw bytes');
+
     await testRawHttpInjector(relayPort, 'http');
     console.log('PASS port 80 viewer: valid upgrade returns 101 and relays raw SSH');
 

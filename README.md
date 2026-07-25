@@ -1,4 +1,4 @@
-# Railway SSH-over-WS Relay v3.1 — HTTP 80 + HTTPS 443
+# Railway SSH-over-WS Relay v3.2 — HTTP 80 + HTTPS 443
 
 This Railway-only relay is designed for HTTP Injector using either:
 
@@ -8,6 +8,20 @@ HTTPS :443 (SSL/TLS ON)
 ```
 
 Both public ports reach the same Railway service and the app listens only on Railway's assigned `$PORT`.
+
+## Exact minimal HTTP Injector payload
+
+The raw `/ssh` route accepts this exact legacy handshake:
+
+```text
+GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
+Host: YOUR-APP.up.railway.app[crlf]
+Upgrade: websocket[crlf]
+Connection: Upgrade[crlf][crlf]
+```
+
+`/ssh` returns `101 Switching Protocols` and then relays raw SSH bytes to `TARGET_HOST:TARGET_PORT`. The strict `/ws` route still requires `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Key`.
+
 
 ## Traffic path
 
