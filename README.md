@@ -1,129 +1,110 @@
-# Railway SSH-over-WS Relay v3.2 — HTTP 80 + HTTPS 443
+# Railway SSH-over-WebSocket Relay v4.0
 
-This Railway-only relay is designed for HTTP Injector using either:
-
-```text
-HTTP  :80  (SSL/TLS OFF)
-HTTPS :443 (SSL/TLS ON)
-```
-
-Both public ports reach the same Railway service and the app listens only on Railway's assigned `$PORT`.
-
-## Exact minimal HTTP Injector payload
-
-The raw `/ssh` route accepts this exact legacy handshake:
+This version fixes the backend design for a VPS that already runs PDirect/SSH-over-WebSocket:
 
 ```text
-GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
-Host: YOUR-APP.up.railway.app[crlf]
-Upgrade: websocket[crlf]
-Connection: Upgrade[crlf][crlf]
+HTTP Injector -> Railway -> VPS PDirect port 80 -> Dropbear port 550
 ```
 
-`/ssh` returns `101 Switching Protocols` and then relays raw SSH bytes to `TARGET_HOST:TARGET_PORT`. The strict `/ws` route still requires `Sec-WebSocket-Version: 13` and `Sec-WebSocket-Key`.
+The default mode is a transparent WebSocket-origin relay. Railway forwards the HTTP upgrade to the VPS WebSocket listener instead of replacing it.
 
-
-## Traffic path
-
-```text
-HTTP Injector :80 or :443
-        -> Railway WebSocket upgrade
-        -> relay app on $PORT
-        -> raw TCP to VPS_IP:550
-        -> Dropbear/SSH
-```
-
-`TARGET_PORT=550` is correct when Dropbear listens on VPS port 550. Do not use VPS port 80 as the backend if port 80 is already PDirect/WebSocket.
-
-## Why you got 301 on port 80
-
-Railway redirects ordinary plain HTTP GET requests. Port 80 must therefore send a **complete valid WebSocket upgrade**. An incomplete payload can be classified as a normal GET and redirected to HTTPS.
-
-Required headers:
-
-- `GET ... HTTP/1.1`
-- `Host` equal to the Railway domain
-- `Upgrade: websocket`
-- `Connection: Upgrade`
-- `Sec-WebSocket-Version: 13`
-- a valid 16-byte Base64 `Sec-WebSocket-Key`
-
-## Railway variables
+## Railway variables for your existing setup
 
 ```env
+ORIGIN_MODE=ws
 TARGET_HOST=YOUR_VPS_PUBLIC_IP
-TARGET_PORT=550
-RELAY_TOKEN=YOUR_LONG_RANDOM_SECRET
+TARGET_PORT=80
+ORIGIN_X_REAL_HOST=127.0.0.1:550
+RELAY_TOKEN=YOUR_LONG_SECRET
 CONNECT_TIMEOUT_MS=10000
 IDLE_TIMEOUT_MS=0
-MAX_CONNECTIONS_PER_IP=5
+MAX_CONNECTIONS_PER_IP=8
 ```
 
-Do not set `PORT`; Railway supplies it automatically.
+Do not manually define `PORT`; Railway supplies it.
 
-## HTTP Injector — port 80
+If PDirect accepts another path, set:
 
-```text
-SSH Server: YOUR-APP.up.railway.app
-SSH Port: 80
-SSL/TLS: OFF
-SNI: blank/off
+```env
+ORIGIN_PATH=/
 ```
 
-Payload:
+Leave `ORIGIN_PATH` unset to preserve `/ssh`.
+
+## Exact HTTP Injector payload
+
+Use the standards-complete payload for Railway:
 
 ```text
-GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
+GET /ssh?token=YOUR_LONG_SECRET HTTP/1.1[crlf]
 Host: YOUR-APP.up.railway.app[crlf]
 Upgrade: websocket[crlf]
 Connection: Upgrade[crlf]
 Sec-WebSocket-Version: 13[crlf]
-Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==[crlf]
-Pragma: no-cache[crlf]
-Cache-Control: no-cache[crlf][crlf]
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf][crlf]
 ```
 
-## HTTP Injector — port 443
+The app also accepts the minimal four-header payload if it reaches the app, and injects missing RFC headers before forwarding to PDirect. Railway's public edge may still require the complete handshake.
+
+## HTTP Injector settings
+
+### TLS/WSS
 
 ```text
-SSH Server: YOUR-APP.up.railway.app
-SSH Port: 443
+Remote proxy / SSH proxy: YOUR-APP.up.railway.app:443
 SSL/TLS: ON
 SNI: YOUR-APP.up.railway.app
+Payload: the payload above
 ```
 
-Use the same payload above.
+### Plain WS attempt
 
-## Important payload rules
+```text
+Remote proxy / SSH proxy: YOUR-APP.up.railway.app:80
+SSL/TLS: OFF
+Payload: the same payload
+```
 
-- The `Host` header must be the Railway domain, not your VPS IP/domain.
-- Do not put `http://` or `https://` in the `Host` header.
-- Do not use `[lf]`; use `[crlf]` so Railway parses a valid HTTP/1.1 request.
-- Do not omit `Sec-WebSocket-Key` or `Sec-WebSocket-Version` on port 80.
-- `/ssh` returns `101` and then carries raw SSH bytes for HTTP Injector/PDirect-style tunneling.
-- `/ws` is RFC 6455 framed mode for a true WebSocket client.
+The application accepts both once Railway forwards the upgrade. If port 80 is redirected before the app logs `upgrade_received`, that response is from Railway's edge, not this code.
 
-## Checks
+## Required VPS checks
+
+```bash
+ss -lntp | grep ':80 '
+curl -i --http1.1 \
+  -H 'Upgrade: websocket' \
+  -H 'Connection: Upgrade' \
+  -H 'Sec-WebSocket-Version: 13' \
+  -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  http://YOUR_VPS_IP/
+```
+
+The VPS response must be `101 Switching Protocols`.
+
+## Railway diagnostics
 
 ```text
 https://YOUR-APP.up.railway.app/health
-https://YOUR-APP.up.railway.app/check-target?token=YOUR_RELAY_TOKEN
+https://YOUR-APP.up.railway.app/check-target?token=YOUR_LONG_SECRET
 ```
 
-`/check-target` should show a banner beginning with `SSH-2.0-`.
+For `ORIGIN_MODE=ws`, `/check-target` must report `statusCode: 101`.
 
-## Local tests
+Railway logs must show:
 
-```bash
-npm run check
-npm test
+```text
+"event":"upgrade_received"
+"event":"tunnel_connected","mode":"ws-origin"
 ```
 
-The test suite verifies:
+If there is no `upgrade_received`, the request was stopped before reaching the app.
 
-- HTTP-viewer upgrade (`X-Forwarded-Proto: http`) returns `101`.
-- HTTPS-viewer upgrade (`X-Forwarded-Proto: https`) returns `101`.
-- SSH banner and raw traffic pass in both directions.
-- Invalid/incomplete WebSocket handshakes return `400`, not a redirect.
-- Wrong token returns `401`.
-- Unreachable Dropbear returns `502`.
+## Optional direct Dropbear mode
+
+Only use this if you deliberately want Railway to replace PDirect:
+
+```env
+ORIGIN_MODE=ssh
+TARGET_HOST=YOUR_VPS_PUBLIC_IP
+TARGET_PORT=550
+```
