@@ -15,21 +15,19 @@ function envInt(name, fallback, min, max) {
 }
 
 const CONFIG = Object.freeze({
-  port: envInt('PORT', 3000, 1, 65535),
+  listenPort: envInt('PORT', 3000, 1, 65535),
   targetHost: String(process.env.TARGET_HOST || '').trim(),
-  targetPort: envInt('TARGET_PORT', 80, 1, 65535),
+  targetPort: envInt('TARGET_PORT', 550, 1, 65535),
   relayToken: String(process.env.RELAY_TOKEN || ''),
-  originPath: String(process.env.ORIGIN_PATH || '/').trim() || '/',
-  originHost: String(process.env.ORIGIN_HOST_HEADER || process.env.TARGET_HOST || '').trim(),
-  xRealHost: String(process.env.ORIGIN_X_REAL_HOST || '127.0.0.1:550').trim(),
   connectTimeoutMs: envInt('CONNECT_TIMEOUT_MS', 10000, 1000, 120000),
   idleTimeoutMs: envInt('IDLE_TIMEOUT_MS', 0, 0, 86400000),
-  maxConnectionsPerIp: envInt('MAX_CONNECTIONS_PER_IP', 8, 1, 1000),
-  maxHeaderBytes: envInt('MAX_ORIGIN_HEADER_BYTES', 65536, 4096, 1048576),
+  maxConnectionsPerIp: envInt('MAX_CONNECTIONS_PER_IP', 5, 1, 1000),
+  maxFrameBytes: envInt('MAX_FRAME_BYTES', 16 * 1024 * 1024, 1024, 64 * 1024 * 1024),
+  pingIntervalMs: envInt('PING_INTERVAL_MS', 25000, 5000, 3600000),
 });
 
-const VERSION = '4.1.0';
-const TUNNEL_PATHS = new Set(['/', '/ssh', '/ssh-ws', '/ws']);
+const RAW_PATHS = new Set(['/', '/ssh', '/ssh-ws', '/raw']);
+const FRAMED_PATHS = new Set(['/ws', '/rfc6455']);
 const activeByIp = new Map();
 
 function log(event, details = {}) {
@@ -44,23 +42,44 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown';
 }
 
-function reserve(ip) {
-  const current = activeByIp.get(ip) || 0;
-  if (current >= CONFIG.maxConnectionsPerIp) return false;
-  activeByIp.set(ip, current + 1);
+function reserveConnection(ip) {
+  const count = activeByIp.get(ip) || 0;
+  if (count >= CONFIG.maxConnectionsPerIp) return false;
+  activeByIp.set(ip, count + 1);
   return true;
 }
 
-function release(ip) {
-  const current = activeByIp.get(ip) || 0;
-  if (current <= 1) activeByIp.delete(ip);
-  else activeByIp.set(ip, current - 1);
+function releaseConnection(ip) {
+  const count = activeByIp.get(ip) || 0;
+  if (count <= 1) activeByIp.delete(ip);
+  else activeByIp.set(ip, count - 1);
 }
 
-function headerContains(value, token) {
-  return typeof value === 'string' && value
-    .split(',')
-    .some((part) => part.trim().toLowerCase() === token);
+function isAuthorized(req, url) {
+  if (!CONFIG.relayToken) return true;
+  return req.headers['x-relay-token'] === CONFIG.relayToken ||
+    url.searchParams.get('token') === CONFIG.relayToken;
+}
+
+function httpResponse(socket, statusCode, body, extraHeaders = {}) {
+  if (socket.destroyed) return;
+  const payload = Buffer.from(`${body}\n`, 'utf8');
+  const headers = {
+    Connection: 'close',
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Content-Length': String(payload.length),
+    ...extraHeaders,
+  };
+  const lines = [`HTTP/1.1 ${statusCode} ${http.STATUS_CODES[statusCode] || 'Error'}`];
+  for (const [name, value] of Object.entries(headers)) lines.push(`${name}: ${value}`);
+  socket.end(`${lines.join('\r\n')}\r\n\r\n${payload.toString('utf8')}`);
+}
+
+function websocketAccept(key) {
+  return crypto
+    .createHash('sha1')
+    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+    .digest('base64');
 }
 
 function validWebSocketKey(key) {
@@ -72,39 +91,15 @@ function validWebSocketKey(key) {
   }
 }
 
-function websocketAccept(key) {
-  return crypto
-    .createHash('sha1')
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest('base64');
-}
-
-function authorized(req, url) {
-  if (!CONFIG.relayToken) return true;
-  return url.searchParams.get('token') === CONFIG.relayToken ||
-    req.headers['x-relay-token'] === CONFIG.relayToken;
-}
-
-function writeHttpError(socket, statusCode, message) {
-  if (socket.destroyed) return;
-  const body = Buffer.from(`${message}\n`);
-  socket.end(
-    `HTTP/1.1 ${statusCode} ${http.STATUS_CODES[statusCode] || 'Error'}\r\n` +
-    'Connection: close\r\n' +
-    'Content-Type: text/plain; charset=utf-8\r\n' +
-    `Content-Length: ${body.length}\r\n` +
-    'Cache-Control: no-store\r\n' +
-    `X-Relay-Version: ${VERSION}\r\n\r\n` +
-    body.toString('utf8')
-  );
-}
-
 function connectTarget() {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host: CONFIG.targetHost, port: CONFIG.targetPort });
-    let settled = false;
+    const socket = net.createConnection({
+      host: CONFIG.targetHost,
+      port: CONFIG.targetPort,
+    });
 
-    const fail = (error) => {
+    let settled = false;
+    const finishReject = (error) => {
       if (settled) return;
       settled = true;
       socket.destroy();
@@ -113,59 +108,47 @@ function connectTarget() {
 
     socket.setNoDelay(true);
     socket.setKeepAlive(true, 30000);
-    socket.setTimeout(CONFIG.connectTimeoutMs, () => fail(new Error('connect timeout')));
-    socket.once('error', fail);
+    socket.setTimeout(CONFIG.connectTimeoutMs, () => {
+      finishReject(new Error(`target connection timed out after ${CONFIG.connectTimeoutMs}ms`));
+    });
+    socket.once('error', finishReject);
     socket.once('connect', () => {
       if (settled) return;
       settled = true;
-      socket.removeListener('error', fail);
       socket.setTimeout(CONFIG.idleTimeoutMs);
+      socket.removeListener('error', finishReject);
       resolve(socket);
     });
   });
 }
 
-function buildOriginHandshake() {
-  const path = CONFIG.originPath.startsWith('/') ? CONFIG.originPath : `/${CONFIG.originPath}`;
-  const host = CONFIG.originHost || CONFIG.targetHost;
-  const lines = [
-    `GET ${path} HTTP/1.1`,
-    `Host: ${host}`,
-    'Upgrade: websocket',
-    'Connection: Upgrade',
-  ];
-  if (CONFIG.xRealHost) lines.push(`X-Real-Host: ${CONFIG.xRealHost}`);
-  return Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'utf8');
-}
-
-function buildClient101(req) {
-  const lines = [
-    'HTTP/1.1 101 Switching Protocols',
-    'Upgrade: websocket',
-    'Connection: Upgrade',
-    `X-Relay-Version: ${VERSION}`,
-    'X-Relay-Mode: pdirect-origin',
-  ];
-
+function writeRawUpgrade(req, socket) {
   const key = req.headers['sec-websocket-key'];
-  if (validWebSocketKey(key)) {
-    lines.push(`Sec-WebSocket-Accept: ${websocketAccept(key)}`);
-  }
+  let response =
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n' +
+    'X-Relay-Mode: raw-ssh\r\n';
 
-  return Buffer.from(`${lines.join('\r\n')}\r\n\r\n`, 'utf8');
+  // Returning Sec-WebSocket-Accept helps proxies that expect a conventional
+  // handshake. The stream after 101 intentionally remains raw for HTTP Injector.
+  if (validWebSocketKey(key)) {
+    response += `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n`;
+  }
+  socket.write(`${response}\r\n`);
 }
 
-function bridge(client, upstream, ip) {
-  let finished = false;
-
+function bridgeRaw(req, client, head, upstream, ip, path) {
+  let closed = false;
   const close = (reason, error) => {
-    if (finished) return;
-    finished = true;
-    release(ip);
+    if (closed) return;
+    closed = true;
     if (!client.destroyed) client.destroy();
     if (!upstream.destroyed) upstream.destroy();
-    log('tunnel_closed', {
+    releaseConnection(ip);
+    log('raw_closed', {
       ip,
+      path,
       reason,
       error: error ? String(error.code || error.message || error) : undefined,
     });
@@ -175,283 +158,377 @@ function bridge(client, upstream, ip) {
   client.setKeepAlive(true, 30000);
   if (CONFIG.idleTimeoutMs > 0) client.setTimeout(CONFIG.idleTimeoutMs);
 
+  writeRawUpgrade(req, client);
+
+  // `head` contains bytes received after the HTTP headers in the same packet.
+  if (head && head.length > 0) upstream.write(head);
+
   client.pipe(upstream);
   upstream.pipe(client);
 
-  client.on('timeout', () => close('client_timeout'));
-  upstream.on('timeout', () => close('origin_timeout'));
+  client.on('timeout', () => close('client_idle_timeout'));
+  upstream.on('timeout', () => close('target_idle_timeout'));
   client.on('error', (error) => close('client_error', error));
-  upstream.on('error', (error) => close('origin_error', error));
+  upstream.on('error', (error) => close('target_error', error));
   client.on('end', () => close('client_end'));
-  upstream.on('end', () => close('origin_end'));
+  upstream.on('end', () => close('target_end'));
   client.on('close', () => close('client_close'));
-  upstream.on('close', () => close('origin_close'));
+  upstream.on('close', () => close('target_close'));
+
+  log('raw_connected', {
+    ip,
+    path,
+    target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+  });
 }
 
-async function openTunnel(req, client, head, ip) {
-  let upstream;
-  try {
-    upstream = await connectTarget();
-  } catch (error) {
-    release(ip);
-    log('origin_connect_error', {
-      ip,
-      target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-      error: String(error.code || error.message || error),
-    });
-    writeHttpError(client, 502, `Cannot connect to ${CONFIG.targetHost}:${CONFIG.targetPort}`);
+function sendFrame(socket, opcode, payload = Buffer.alloc(0)) {
+  if (!Buffer.isBuffer(payload)) payload = Buffer.from(payload);
+  const length = payload.length;
+  let header;
+  if (length < 126) {
+    header = Buffer.allocUnsafe(2);
+    header[1] = length;
+  } else if (length <= 0xffff) {
+    header = Buffer.allocUnsafe(4);
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(length), 2);
+  }
+  header[0] = 0x80 | (opcode & 0x0f);
+  return socket.write(Buffer.concat([header, payload]));
+}
+
+class FrameParser {
+  constructor(handlers) {
+    this.buffer = Buffer.alloc(0);
+    this.handlers = handlers;
+    this.fragmentOpcode = null;
+  }
+
+  push(chunk) {
+    if (!chunk || chunk.length === 0) return;
+    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : Buffer.from(chunk);
+
+    try {
+      while (this.buffer.length >= 2) {
+        const first = this.buffer[0];
+        const second = this.buffer[1];
+        const fin = Boolean(first & 0x80);
+        const rsv = first & 0x70;
+        const opcode = first & 0x0f;
+        const masked = Boolean(second & 0x80);
+        let length = second & 0x7f;
+        let offset = 2;
+
+        if (rsv !== 0) throw new Error('RSV bits are not supported');
+        if (!masked) throw new Error('client frames must be masked');
+        if (opcode >= 0x8 && !fin) throw new Error('control frames must not be fragmented');
+
+        if (length === 126) {
+          if (this.buffer.length < 4) return;
+          length = this.buffer.readUInt16BE(2);
+          offset = 4;
+        } else if (length === 127) {
+          if (this.buffer.length < 10) return;
+          const bigLength = this.buffer.readBigUInt64BE(2);
+          if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('frame is too large');
+          length = Number(bigLength);
+          offset = 10;
+        }
+
+        if (opcode >= 0x8 && length > 125) throw new Error('control frame payload exceeds 125 bytes');
+        if (length > CONFIG.maxFrameBytes) throw new Error('frame exceeds MAX_FRAME_BYTES');
+        if (this.buffer.length < offset + 4 + length) return;
+
+        const mask = this.buffer.subarray(offset, offset + 4);
+        offset += 4;
+        const payload = Buffer.from(this.buffer.subarray(offset, offset + length));
+        this.buffer = this.buffer.subarray(offset + length);
+        for (let i = 0; i < payload.length; i += 1) payload[i] ^= mask[i & 3];
+
+        if (opcode === 0x0) {
+          if (this.fragmentOpcode == null) throw new Error('unexpected continuation frame');
+          this.handlers.data(payload);
+          if (fin) this.fragmentOpcode = null;
+        } else if (opcode === 0x1 || opcode === 0x2) {
+          if (this.fragmentOpcode != null) throw new Error('new data frame during fragmented message');
+          this.handlers.data(payload);
+          if (!fin) this.fragmentOpcode = opcode;
+        } else if (opcode === 0x8) {
+          this.handlers.close(payload);
+          return;
+        } else if (opcode === 0x9) {
+          this.handlers.ping(payload);
+        } else if (opcode === 0xA) {
+          this.handlers.pong(payload);
+        } else {
+          throw new Error(`unsupported opcode ${opcode}`);
+        }
+      }
+    } catch (error) {
+      this.handlers.error(error);
+    }
+  }
+}
+
+function bridgeFramed(req, client, head, upstream, ip, path) {
+  const key = req.headers['sec-websocket-key'];
+  const version = req.headers['sec-websocket-version'];
+  if (!validWebSocketKey(key) || version !== '13') {
+    upstream.destroy();
+    releaseConnection(ip);
+    httpResponse(client, 400, 'Valid RFC 6455 Sec-WebSocket-Key and version 13 are required');
     return;
   }
 
-  if (client.destroyed) {
-    upstream.destroy();
-    release(ip);
-    return;
-  }
-
-  upstream.write(buildOriginHandshake());
-
-  let buffer = Buffer.alloc(0);
-  let completed = false;
-
-  const fail = (message, error) => {
-    if (completed) return;
-    completed = true;
-    upstream.destroy();
-    release(ip);
-    log('origin_handshake_failed', {
+  let closed = false;
+  let pingTimer;
+  const close = (reason, error) => {
+    if (closed) return;
+    closed = true;
+    if (pingTimer) clearInterval(pingTimer);
+    if (!client.destroyed) client.destroy();
+    if (!upstream.destroyed) upstream.destroy();
+    releaseConnection(ip);
+    log('ws_closed', {
       ip,
-      target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-      message,
+      path,
+      reason,
       error: error ? String(error.code || error.message || error) : undefined,
     });
-    writeHttpError(client, 502, message);
   };
 
-  const handshakeTimer = setTimeout(
-    () => fail('PDirect did not return 101 before timeout'),
-    CONFIG.connectTimeoutMs
+  client.write(
+    'HTTP/1.1 101 Switching Protocols\r\n' +
+    'Upgrade: websocket\r\n' +
+    'Connection: Upgrade\r\n' +
+    `Sec-WebSocket-Accept: ${websocketAccept(key)}\r\n` +
+    'X-Relay-Mode: rfc6455\r\n\r\n'
   );
 
-  const beforeHandshakeError = (error) => fail('PDirect connection failed before 101', error);
-  upstream.once('error', beforeHandshakeError);
-  upstream.once('end', () => fail('PDirect closed before returning 101'));
-  upstream.once('close', () => fail('PDirect closed before returning 101'));
+  client.setNoDelay(true);
+  client.setKeepAlive(true, 30000);
+  if (CONFIG.idleTimeoutMs > 0) client.setTimeout(CONFIG.idleTimeoutMs);
 
-  function onData(chunk) {
-    if (completed) return;
-    buffer = Buffer.concat([buffer, chunk]);
+  const parser = new FrameParser({
+    data(payload) {
+      if (!upstream.destroyed && !upstream.write(payload)) client.pause();
+    },
+    ping(payload) {
+      if (!client.destroyed) sendFrame(client, 0xA, payload);
+    },
+    pong() {},
+    close(payload) {
+      if (!client.destroyed) sendFrame(client, 0x8, payload);
+      close('client_close_frame');
+    },
+    error(error) {
+      if (!client.destroyed) sendFrame(client, 0x8, Buffer.from([0x03, 0xEA]));
+      close('protocol_error', error);
+    },
+  });
 
-    if (buffer.length > CONFIG.maxHeaderBytes) {
-      fail('PDirect response headers are too large');
-      return;
-    }
+  client.on('data', (chunk) => parser.push(chunk));
+  client.on('drain', () => upstream.resume());
+  upstream.on('drain', () => client.resume());
+  upstream.on('data', (chunk) => {
+    if (!client.destroyed && !sendFrame(client, 0x2, chunk)) upstream.pause();
+  });
 
-    const headerEnd = buffer.indexOf('\r\n\r\n');
-    if (headerEnd < 0) return;
+  client.on('timeout', () => close('client_idle_timeout'));
+  upstream.on('timeout', () => close('target_idle_timeout'));
+  client.on('error', (error) => close('client_error', error));
+  upstream.on('error', (error) => close('target_error', error));
+  client.on('end', () => close('client_end'));
+  upstream.on('end', () => {
+    if (!client.destroyed) sendFrame(client, 0x8);
+    close('target_end');
+  });
+  client.on('close', () => close('client_close'));
+  upstream.on('close', () => close('target_close'));
 
-    const headerText = buffer.subarray(0, headerEnd).toString('latin1');
-    const statusLine = headerText.split('\r\n')[0] || '';
-    const match = /^HTTP\/1\.[01]\s+(\d{3})\b/.exec(statusLine);
-    const statusCode = match ? Number(match[1]) : 0;
-    const remainder = buffer.subarray(headerEnd + 4);
+  pingTimer = setInterval(() => {
+    if (!client.destroyed) sendFrame(client, 0x9, Buffer.from('keepalive'));
+  }, CONFIG.pingIntervalMs);
+  pingTimer.unref();
 
-    if (statusCode !== 101) {
-      fail(`PDirect returned ${statusLine || 'an invalid response'} instead of 101`);
-      return;
-    }
+  if (head && head.length > 0) parser.push(head);
 
-    completed = true;
-    clearTimeout(handshakeTimer);
-    upstream.removeListener('data', onData);
-    upstream.removeListener('error', beforeHandshakeError);
-    upstream.removeAllListeners('end');
-    upstream.removeAllListeners('close');
-
-    // Generate a clean viewer-side 101. Do not copy PDirect's response because
-    // legacy PDirect usually omits Sec-WebSocket-Accept.
-    client.write(buildClient101(req));
-
-    // Bytes after PDirect's headers may already contain the SSH banner.
-    if (remainder.length) client.write(remainder);
-
-    // Node may already have parsed bytes sent immediately after the viewer's
-    // HTTP headers. Forward them only after the origin handshake succeeded.
-    if (head && head.length) upstream.write(head);
-
-    log('tunnel_connected', {
-      ip,
-      target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
-      originPath: CONFIG.originPath,
-      xRealHost: CONFIG.xRealHost || null,
-      viewerProto: req.headers['x-forwarded-proto'] || 'direct',
-      viewerHasKey: validWebSocketKey(req.headers['sec-websocket-key']),
-    });
-
-    bridge(client, upstream, ip);
-  }
-
-  upstream.on('data', onData);
-}
-
-async function checkTarget() {
-  let socket;
-  try {
-    socket = await connectTarget();
-  } catch (error) {
-    return { ok: false, error: String(error.code || error.message || error) };
-  }
-
-  socket.write(buildOriginHandshake());
-  return await new Promise((resolve) => {
-    let buffer = Buffer.alloc(0);
-    const started = Date.now();
-    const timer = setTimeout(() => {
-      socket.destroy();
-      resolve({ ok: false, error: 'PDirect handshake timeout' });
-    }, CONFIG.connectTimeoutMs);
-
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      const end = buffer.indexOf('\r\n\r\n');
-      if (end < 0) return;
-
-      clearTimeout(timer);
-      const headerText = buffer.subarray(0, end).toString('latin1');
-      const statusLine = headerText.split('\r\n')[0] || '';
-      const match = /^HTTP\/1\.[01]\s+(\d{3})\b/.exec(statusLine);
-      const statusCode = match ? Number(match[1]) : 0;
-      const banner = buffer.subarray(end + 4, end + 260).toString('utf8').replace(/[\r\n]+$/g, '');
-      socket.destroy();
-      resolve({
-        ok: statusCode === 101,
-        statusCode,
-        statusLine,
-        banner: banner || null,
-        looksLikeSsh: banner.startsWith('SSH-'),
-        elapsedMs: Date.now() - started,
-      });
-    });
-
-    socket.once('error', (error) => {
-      clearTimeout(timer);
-      resolve({ ok: false, error: String(error.code || error.message || error) });
-    });
+  log('ws_connected', {
+    ip,
+    path,
+    target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
   });
 }
 
 const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url || '/', 'http://relay.local');
+  const requestUrl = new URL(req.url || '/', 'http://relay.local');
 
-  if (url.pathname === '/health') {
-    res.writeHead(CONFIG.targetHost ? 200 : 503, {
+  if (requestUrl.pathname === '/health') {
+    const configured = Boolean(CONFIG.targetHost);
+    res.writeHead(configured ? 200 : 503, {
       'content-type': 'application/json; charset=utf-8',
       'cache-control': 'no-store',
-      'x-relay-version': VERSION,
     });
     res.end(JSON.stringify({
-      ok: Boolean(CONFIG.targetHost),
+      ok: configured,
       service: 'railway-ssh-ws-relay',
-      version: VERSION,
-      target: CONFIG.targetHost ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
-      originPath: CONFIG.originPath,
-      originHost: CONFIG.originHost || null,
-      originXRealHost: CONFIG.xRealHost || null,
-      activeConnections: [...activeByIp.values()].reduce((sum, value) => sum + value, 0),
+      version: '2.0.0',
+      target: configured ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
+      rawHttpInjectorPaths: [...RAW_PATHS],
+      framedWebSocketPaths: [...FRAMED_PATHS],
+      activeConnections: [...activeByIp.values()].reduce((sum, count) => sum + count, 0),
     }));
     return;
   }
 
-  if (url.pathname === '/check-target') {
-    if (!authorized(req, url)) {
+  if (requestUrl.pathname === '/check-target') {
+    if (!isAuthorized(req, requestUrl)) {
       res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: false, error: 'Invalid relay token' }));
       return;
     }
-    const result = CONFIG.targetHost
-      ? await checkTarget()
-      : { ok: false, error: 'TARGET_HOST is not configured' };
-    res.writeHead(result.ok ? 200 : 502, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-    });
-    res.end(JSON.stringify({
-      ...result,
-      target: CONFIG.targetHost ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
-    }));
+    if (!CONFIG.targetHost) {
+      res.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: 'TARGET_HOST is not configured' }));
+      return;
+    }
+
+    let target;
+    try {
+      target = await connectTarget();
+      const started = Date.now();
+      const banner = await new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          resolve(value);
+        };
+        const timer = setTimeout(() => finish(''), 3000);
+        target.once('data', (chunk) => {
+          clearTimeout(timer);
+          finish(chunk.subarray(0, 512).toString('utf8').replace(/[\r\n]+$/g, ''));
+        });
+        target.once('error', () => {
+          clearTimeout(timer);
+          finish('');
+        });
+        target.once('close', () => {
+          clearTimeout(timer);
+          finish('');
+        });
+      });
+      target.destroy();
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        reachable: true,
+        target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+        connectAndBannerMs: Date.now() - started,
+        banner: banner || null,
+        looksLikeSsh: banner.startsWith('SSH-'),
+      }));
+    } catch (error) {
+      if (target && !target.destroyed) target.destroy();
+      res.writeHead(502, {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      });
+      res.end(JSON.stringify({
+        ok: false,
+        reachable: false,
+        target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+        error: String(error.code || error.message || error),
+      }));
+    }
     return;
   }
 
-  if (TUNNEL_PATHS.has(url.pathname)) {
-    res.writeHead(426, {
-      'content-type': 'text/plain; charset=utf-8',
-      'cache-control': 'no-store',
-      upgrade: 'websocket',
-      'x-relay-version': VERSION,
-    });
-    res.end('WebSocket upgrade required.\n');
-    return;
-  }
-
-  res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
-  res.end('Not found.\n');
+  res.writeHead(200, {
+    'content-type': 'text/plain; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  res.end(
+    'Railway SSH-over-WebSocket relay v2.0\n' +
+    'HTTP Injector raw tunnel: /ssh\n' +
+    'RFC 6455 framed tunnel: /ws\n'
+  );
 });
 
 server.on('upgrade', async (req, socket, head) => {
-  let url;
-  try {
-    url = new URL(req.url || '/', 'http://relay.local');
-  } catch {
-    writeHttpError(socket, 400, 'Invalid URL');
-    return;
-  }
-
-  if (req.method !== 'GET') {
-    writeHttpError(socket, 400, 'GET is required');
-    return;
-  }
-  if (String(req.headers.upgrade || '').toLowerCase() !== 'websocket') {
-    writeHttpError(socket, 400, 'Upgrade: websocket is required');
-    return;
-  }
-  if (!headerContains(req.headers.connection, 'upgrade')) {
-    writeHttpError(socket, 400, 'Connection: Upgrade is required');
-    return;
-  }
-  if (!TUNNEL_PATHS.has(url.pathname)) {
-    writeHttpError(socket, 404, 'Unknown tunnel path; use /ssh');
-    return;
-  }
-  if (!authorized(req, url)) {
-    writeHttpError(socket, 401, 'Invalid relay token');
-    return;
-  }
-  if (!CONFIG.targetHost) {
-    writeHttpError(socket, 503, 'TARGET_HOST is not configured');
-    return;
-  }
-
   const ip = clientIp(req);
-  if (!reserve(ip)) {
-    writeHttpError(socket, 429, 'Too many active connections');
+  let requestUrl;
+
+  try {
+    requestUrl = new URL(req.url || '/', 'http://relay.local');
+  } catch {
+    httpResponse(socket, 400, 'Invalid request URL');
     return;
   }
 
+  const path = requestUrl.pathname;
   log('upgrade_received', {
     ip,
-    path: url.pathname,
+    path,
     host: req.headers.host || '',
-    viewerProto: req.headers['x-forwarded-proto'] || 'direct',
-    viewerHasKey: validWebSocketKey(req.headers['sec-websocket-key']),
-    target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+    forwardedProto: req.headers['x-forwarded-proto'] || '',
+    hasWebSocketKey: validWebSocketKey(req.headers['sec-websocket-key']),
   });
 
-  await openTunnel(req, socket, head, ip);
+  if (!CONFIG.targetHost) {
+    httpResponse(socket, 503, 'TARGET_HOST is not configured');
+    return;
+  }
+  if (!RAW_PATHS.has(path) && !FRAMED_PATHS.has(path)) {
+    httpResponse(socket, 404, 'Unknown relay path; use /ssh for HTTP Injector');
+    return;
+  }
+  if (!isAuthorized(req, requestUrl)) {
+    httpResponse(socket, 401, 'Invalid relay token');
+    return;
+  }
+  if (!reserveConnection(ip)) {
+    httpResponse(socket, 429, 'Too many active connections');
+    return;
+  }
+
+  let upstream;
+  try {
+    upstream = await connectTarget();
+  } catch (error) {
+    releaseConnection(ip);
+    log('target_connect_error', {
+      ip,
+      path,
+      target: `${CONFIG.targetHost}:${CONFIG.targetPort}`,
+      error: String(error.code || error.message || error),
+    });
+    httpResponse(socket, 502, `Cannot connect to SSH backend ${CONFIG.targetHost}:${CONFIG.targetPort}`);
+    return;
+  }
+
+  // The client may disconnect while the relay is establishing the target TCP connection.
+  if (socket.destroyed) {
+    upstream.destroy();
+    releaseConnection(ip);
+    return;
+  }
+
+  if (RAW_PATHS.has(path)) bridgeRaw(req, socket, head, upstream, ip, path);
+  else bridgeFramed(req, socket, head, upstream, ip, path);
 });
 
 server.on('clientError', (error, socket) => {
   log('client_http_error', { error: error.message });
-  writeHttpError(socket, 400, 'Bad HTTP request');
+  httpResponse(socket, 400, 'Bad HTTP request');
 });
 
 server.on('error', (error) => {
@@ -459,12 +536,13 @@ server.on('error', (error) => {
   process.exitCode = 1;
 });
 
-server.listen(CONFIG.port, '0.0.0.0', () => {
+server.listen(CONFIG.listenPort, '0.0.0.0', () => {
   log('listening', {
-    port: CONFIG.port,
+    port: CONFIG.listenPort,
     target: CONFIG.targetHost ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
-    originPath: CONFIG.originPath,
     tokenRequired: Boolean(CONFIG.relayToken),
+    rawPaths: [...RAW_PATHS],
+    framedPaths: [...FRAMED_PATHS],
   });
 });
 
