@@ -94,12 +94,13 @@ function connectAndCollect(port, request, assertion) {
   });
 }
 
-async function testRawHttpInjector(port) {
+async function testRawHttpInjector(port, forwardedProto = 'http') {
   let phase = 'headers';
   await connectAndCollect(
     port,
     'GET /ssh?token=test-secret HTTP/1.1\r\n' +
       'Host: railway.test\r\n' +
+      `X-Forwarded-Proto: ${forwardedProto}\r\n` +
       'Upgrade: websocket\r\n' +
       'Connection: Upgrade\r\n' +
       'Sec-WebSocket-Version: 13\r\n' +
@@ -227,22 +228,32 @@ async function startRelay(relayPort, targetPort) {
   const relay = await startRelay(relayPort, targetPort);
 
   try {
-    await testRawHttpInjector(relayPort);
-    console.log('PASS raw /ssh: 101, SSH banner, and bidirectional raw bytes');
+    await testRawHttpInjector(relayPort, 'http');
+    console.log('PASS port 80 viewer: valid upgrade returns 101 and relays raw SSH');
+
+    await testRawHttpInjector(relayPort, 'https');
+    console.log('PASS port 443 viewer: valid upgrade returns 101 and relays raw SSH');
 
     await testFramedWebSocket(relayPort);
     console.log('PASS framed /ws: RFC 6455 handshake and bidirectional SSH bytes');
 
     await testStatus(
       relayPort,
-      'GET /ssh?token=wrong HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+      'GET /ssh?token=test-secret HTTP/1.1\r\nHost: test\r\n\r\n',
+      426
+    );
+    console.log('PASS incomplete port-80 request: 426 from app, never app-level 301');
+
+    await testStatus(
+      relayPort,
+      'GET /ssh?token=wrong HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
       401
     );
     console.log('PASS invalid token: 401');
 
     await testStatus(
       relayPort,
-      'GET /wrong?token=test-secret HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+      'GET /wrong?token=test-secret HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
       404
     );
     console.log('PASS invalid path: 404');
@@ -257,7 +268,7 @@ async function startRelay(relayPort, targetPort) {
   try {
     await testStatus(
       relayPort2,
-      'GET /ssh?token=test-secret HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n',
+      'GET /ssh?token=test-secret HTTP/1.1\r\nHost: test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n',
       502
     );
     console.log('PASS unreachable SSH backend: 502');

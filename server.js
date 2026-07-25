@@ -91,6 +91,28 @@ function validWebSocketKey(key) {
   }
 }
 
+function headerHasToken(value, token) {
+  if (typeof value !== 'string') return false;
+  return value.split(',').some((part) => part.trim().toLowerCase() === token);
+}
+
+function validateUpgradeRequest(req) {
+  if (req.method !== 'GET') return 'WebSocket upgrade must use GET';
+  if (String(req.headers.upgrade || '').toLowerCase() !== 'websocket') {
+    return 'Upgrade: websocket is required';
+  }
+  if (!headerHasToken(req.headers.connection, 'upgrade')) {
+    return 'Connection: Upgrade is required';
+  }
+  if (req.headers['sec-websocket-version'] !== '13') {
+    return 'Sec-WebSocket-Version: 13 is required';
+  }
+  if (!validWebSocketKey(req.headers['sec-websocket-key'])) {
+    return 'A valid 16-byte Sec-WebSocket-Key is required';
+  }
+  return null;
+}
+
 function connectTarget() {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({
@@ -377,12 +399,25 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       ok: configured,
       service: 'railway-ssh-ws-relay',
-      version: '2.0.0',
+      version: '3.1.0',
       target: configured ? `${CONFIG.targetHost}:${CONFIG.targetPort}` : null,
       rawHttpInjectorPaths: [...RAW_PATHS],
       framedWebSocketPaths: [...FRAMED_PATHS],
       activeConnections: [...activeByIp.values()].reduce((sum, count) => sum + count, 0),
+      railwayExternalPorts: { http: 80, https: 443 },
+      note: 'Both external ports map to the same Railway PORT; port 80 requires a complete WebSocket upgrade request',
     }));
+    return;
+  }
+
+  if (RAW_PATHS.has(requestUrl.pathname) || FRAMED_PATHS.has(requestUrl.pathname)) {
+    res.writeHead(426, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'upgrade': 'websocket',
+      'connection': 'close',
+    });
+    res.end('A complete WebSocket upgrade is required. Use Upgrade: websocket, Connection: Upgrade, Sec-WebSocket-Version: 13, and a valid Sec-WebSocket-Key.\n');
     return;
   }
 
@@ -457,8 +492,9 @@ const server = http.createServer(async (req, res) => {
     'cache-control': 'no-store',
   });
   res.end(
-    'Railway SSH-over-WebSocket relay v2.0\n' +
+    'Railway SSH-over-WebSocket relay v3.1\n' +
     'HTTP Injector raw tunnel: /ssh\n' +
+    'HTTP Injector raw tunnel: /ssh (valid WebSocket upgrade required)\n' +
     'RFC 6455 framed tunnel: /ws\n'
   );
 });
@@ -475,6 +511,18 @@ server.on('upgrade', async (req, socket, head) => {
   }
 
   const path = requestUrl.pathname;
+  const upgradeError = validateUpgradeRequest(req);
+  if (upgradeError) {
+    log('upgrade_rejected', {
+      ip,
+      path,
+      reason: upgradeError,
+      forwardedProto: req.headers['x-forwarded-proto'] || '',
+    });
+    httpResponse(socket, 400, upgradeError);
+    return;
+  }
+
   log('upgrade_received', {
     ip,
     path,

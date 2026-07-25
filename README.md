@@ -1,14 +1,38 @@
-# Railway SSH-over-WebSocket Relay v2.0
+# Railway SSH-over-WS Relay v3.1 — HTTP 80 + HTTPS 443
 
-This project relays an authorized HTTP Injector SSH tunnel from Railway to a fixed SSH or Dropbear service on your own VPS.
-
-## Correct connection path
+This Railway-only relay is designed for HTTP Injector using either:
 
 ```text
-HTTP Injector -- TLS/WSS port 443 --> Railway relay -- raw TCP --> VPS_IP:550 Dropbear
+HTTP  :80  (SSL/TLS OFF)
+HTTPS :443 (SSL/TLS ON)
 ```
 
-`TARGET_PORT=550` is correct when Dropbear listens on VPS port 550. Do not point the relay to VPS port 80 when port 80 is PDirect/WebSocket; the Railway service already performs the HTTP upgrade.
+Both public ports reach the same Railway service and the app listens only on Railway's assigned `$PORT`.
+
+## Traffic path
+
+```text
+HTTP Injector :80 or :443
+        -> Railway WebSocket upgrade
+        -> relay app on $PORT
+        -> raw TCP to VPS_IP:550
+        -> Dropbear/SSH
+```
+
+`TARGET_PORT=550` is correct when Dropbear listens on VPS port 550. Do not use VPS port 80 as the backend if port 80 is already PDirect/WebSocket.
+
+## Why you got 301 on port 80
+
+Railway redirects ordinary plain HTTP GET requests. Port 80 must therefore send a **complete valid WebSocket upgrade**. An incomplete payload can be classified as a normal GET and redirected to HTTPS.
+
+Required headers:
+
+- `GET ... HTTP/1.1`
+- `Host` equal to the Railway domain
+- `Upgrade: websocket`
+- `Connection: Upgrade`
+- `Sec-WebSocket-Version: 13`
+- a valid 16-byte Base64 `Sec-WebSocket-Key`
 
 ## Railway variables
 
@@ -21,94 +45,58 @@ IDLE_TIMEOUT_MS=0
 MAX_CONNECTIONS_PER_IP=5
 ```
 
-Your VPS firewall/security group must allow inbound TCP 550. Test from another machine:
+Do not set `PORT`; Railway supplies it automatically.
 
-```bash
-nc -vz YOUR_VPS_PUBLIC_IP 550
-```
-
-A reachable SSH port should also show an SSH banner:
-
-```bash
-timeout 5 bash -c 'cat < /dev/null > /dev/tcp/YOUR_VPS_PUBLIC_IP/550'
-```
-
-## Deploy
-
-1. Upload this folder to GitHub.
-2. Create a Railway project from the repository.
-3. Add the variables above.
-4. Generate a Railway public domain.
-5. Open `https://YOUR_RAILWAY_DOMAIN/health`.
-
-Expected health result includes:
-
-```json
-{"ok":true,"version":"2.0.0","target":"YOUR_VPS_PUBLIC_IP:550"}
-```
-
-Then verify that Railway can actually reach Dropbear:
+## HTTP Injector — port 80
 
 ```text
-https://YOUR_RAILWAY_DOMAIN/check-target?token=YOUR_RELAY_TOKEN
+SSH Server: YOUR-APP.up.railway.app
+SSH Port: 80
+SSL/TLS: OFF
+SNI: blank/off
 ```
 
-A correct response should contain `"reachable":true`, an `SSH-2.0-...` banner, and `"looksLikeSsh":true`. A `502` here means the VPS IP, port, firewall, or Dropbear listener is wrong.
-
-## HTTP Injector configuration
-
-Use Railway on public port 443:
-
-```text
-SSH host/server: YOUR_RAILWAY_DOMAIN
-SSH port: 443
-SSL/TLS: ON
-SNI: YOUR_RAILWAY_DOMAIN
-SSH username/password: your VPS SSH account
-```
-
-Use this custom payload:
+Payload:
 
 ```text
 GET /ssh?token=YOUR_RELAY_TOKEN HTTP/1.1[crlf]
-Host: YOUR_RAILWAY_DOMAIN[crlf]
+Host: YOUR-APP.up.railway.app[crlf]
 Upgrade: websocket[crlf]
 Connection: Upgrade[crlf]
 Sec-WebSocket-Version: 13[crlf]
-Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[crlf][crlf]
+Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==[crlf]
+Pragma: no-cache[crlf]
+Cache-Control: no-cache[crlf][crlf]
 ```
 
-The `/ssh` route intentionally behaves like PDirect: it returns `101 Switching Protocols` and then passes raw SSH bytes to Dropbear.
+## HTTP Injector — port 443
 
-Expected response:
-
-```http
-HTTP/1.1 101 Switching Protocols
-Upgrade: websocket
-Connection: Upgrade
-X-Relay-Mode: raw-ssh
+```text
+SSH Server: YOUR-APP.up.railway.app
+SSH Port: 443
+SSL/TLS: ON
+SNI: YOUR-APP.up.railway.app
 ```
 
-For a true RFC 6455 WebSocket client, use `/ws?token=...` instead. HTTP Injector custom-payload mode should use `/ssh`.
+Use the same payload above.
 
-## Important port behavior
+## Important payload rules
 
-- Public `443`: use this with Railway and enable SSL/TLS in HTTP Injector.
-- Public `80`: Railway's edge may redirect HTTP to HTTPS, resulting in `301` before this app receives the request.
-- Backend `550`: Railway connects here on your VPS because this is Dropbear/SSH.
-- VPS `80`: not used by this relay if it runs PDirect/WebSocket.
+- The `Host` header must be the Railway domain, not your VPS IP/domain.
+- Do not put `http://` or `https://` in the `Host` header.
+- Do not use `[lf]`; use `[crlf]` so Railway parses a valid HTTP/1.1 request.
+- Do not omit `Sec-WebSocket-Key` or `Sec-WebSocket-Version` on port 80.
+- `/ssh` returns `101` and then carries raw SSH bytes for HTTP Injector/PDirect-style tunneling.
+- `/ws` is RFC 6455 framed mode for a true WebSocket client.
 
-The Node app itself never sends a `301` redirect.
+## Checks
 
-## Status codes
+```text
+https://YOUR-APP.up.railway.app/health
+https://YOUR-APP.up.railway.app/check-target?token=YOUR_RELAY_TOKEN
+```
 
-- `101`: upgrade succeeded.
-- `301`/`308`: Railway or another edge redirected HTTP to HTTPS; use port 443 with SSL enabled.
-- `401`: missing or incorrect `RELAY_TOKEN`.
-- `404`: wrong path; use `/ssh`.
-- `429`: too many simultaneous connections from one IP.
-- `502`: Railway cannot reach `TARGET_HOST:TARGET_PORT`.
-- `503`: `TARGET_HOST` is missing.
+`/check-target` should show a banner beginning with `SSH-2.0-`.
 
 ## Local tests
 
@@ -117,10 +105,11 @@ npm run check
 npm test
 ```
 
-The tests create a mock Dropbear-style backend and verify:
+The test suite verifies:
 
-- `/ssh` returns 101 and relays the SSH banner plus raw bidirectional bytes.
-- `/ws` performs RFC 6455 framing and relays SSH bytes.
-- Invalid token returns 401.
-- Invalid path returns 404.
-- Unreachable backend returns 502.
+- HTTP-viewer upgrade (`X-Forwarded-Proto: http`) returns `101`.
+- HTTPS-viewer upgrade (`X-Forwarded-Proto: https`) returns `101`.
+- SSH banner and raw traffic pass in both directions.
+- Invalid/incomplete WebSocket handshakes return `400`, not a redirect.
+- Wrong token returns `401`.
+- Unreachable Dropbear returns `502`.
